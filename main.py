@@ -1,10 +1,9 @@
 """해양 식물플랑크톤 분류 실험실 - 홈 화면 (Streamlit)
 
 실행: streamlit run main.py
-데이터: main.py 와 같은 폴더에 있는 새만금 해양수질자동측정망 CSV 파일
+데이터: GitHub에 올려 둔 새만금 해양수질자동측정망 CSV (아래 DATA_URL)
 """
 
-import io
 from datetime import datetime
 from html import escape
 from pathlib import Path
@@ -15,7 +14,8 @@ import streamlit as st
 APP_TITLE = "해양 식물플랑크톤 분류 실험실"
 APP_ICON = "🌊"
 
-DATA_FILENAME = "해양환경공단_해양수질자동측정망_새만금_raw_file.csv"
+DATA_URL = "https://raw.githubusercontent.com/hsc-go/data/main/ocean_water_quality.csv"
+LOCAL_FILENAME = "ocean_water_quality.csv"  # 인터넷 연결이 안 될 때 쓰는 예비 파일(선택)
 MEASURE_COLS = ["전기전도도", "수온", "수소이온농도", "용존산소량", "탁도", "염분", "클로로필"]
 
 st.set_page_config(
@@ -128,6 +128,7 @@ label, [data-testid="stWidgetLabel"] p { color: #12274D !important; font-weight:
     border-radius: 8px; padding: 16px 20px; color: #1D2B3A; line-height: 1.8; font-size: 0.97rem;
 }
 .source-box b { color: #12274D; }
+.source-box a { color: #0B6E6E; word-break: break-all; }
 
 @media (max-width: 800px) {
     .card-grid { grid-template-columns: repeat(2, 1fr); }
@@ -141,18 +142,26 @@ st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
 # ---------------------------------------------------------------------------
 # 데이터 불러오기
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner="데이터를 불러오는 중입니다...")
-def load_data(raw_bytes: bytes):
-    """CSV 바이트를 읽어 (원본, 정제본) 데이터프레임을 반환한다."""
-    raw = None
-    for enc in ("utf-8-sig", "cp949"):  # 공공데이터 한글 CSV는 cp949인 경우가 많음
-        try:
-            raw = pd.read_csv(io.BytesIO(raw_bytes), encoding=enc)
-            break
-        except UnicodeDecodeError:
-            continue
-    if raw is None:
-        raise ValueError("CSV 인코딩을 인식하지 못했습니다. UTF-8 또는 CP949 파일을 사용해 주세요.")
+@st.cache_data(ttl=3600, show_spinner="데이터를 불러오는 중입니다...")
+def load_data():
+    """원격 CSV를 읽어 (원본, 정제본) 데이터프레임을 반환한다."""
+    try:
+        raw = pd.read_csv(DATA_URL, encoding="utf-8-sig")
+    except Exception as remote_error:
+        local = Path(__file__).resolve().parent / LOCAL_FILENAME
+        if not local.exists():
+            raise RuntimeError(
+                f"데이터 주소에서 파일을 읽지 못했습니다. 주소와 인터넷 연결을 확인해 주세요. ({remote_error})"
+            )
+        raw = None
+        for enc in ("utf-8-sig", "cp949"):
+            try:
+                raw = pd.read_csv(local, encoding=enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if raw is None:
+            raise RuntimeError("예비 파일의 인코딩을 인식하지 못했습니다. UTF-8 또는 CP949로 저장해 주세요.")
 
     clean = raw.copy()
     clean["관측일자"] = pd.to_datetime(clean["관측일자"], errors="coerce")
@@ -160,15 +169,6 @@ def load_data(raw_bytes: bytes):
         # '미수신' 같은 문자열은 결측(NaN)으로 처리
         clean[col] = pd.to_numeric(clean[col], errors="coerce")
     return raw, clean
-
-
-def find_data_file():
-    base = Path(__file__).resolve().parent
-    exact = base / DATA_FILENAME
-    if exact.exists():
-        return exact
-    candidates = sorted(base.glob("*새만금*.csv"))
-    return candidates[0] if candidates else None
 
 
 # ---------------------------------------------------------------------------
@@ -282,8 +282,11 @@ def render_home(raw, clean):
     start, end = clean["관측일자"].min(), clean["관측일자"].max()
     span_days = (end - start).days + 1
     interval = clean["관측일자"].diff().dropna().dt.total_seconds().median() / 60
-    n_missing = int(clean[MEASURE_COLS].isna().sum().sum())
-    pct_missing = n_missing / (n_rows * len(MEASURE_COLS)) * 100
+    n_blank = int(clean[MEASURE_COLS].isna().sum().sum())
+    step = max(int(round(interval)), 1)
+    expected = len(pd.date_range(start, end, freq=f"{step}min"))
+    missing_slots = max(expected - n_rows, 0)
+    pct_slots = missing_slots / expected * 100 if expected else 0
     station = ", ".join(sorted(clean["정점명"].astype(str).unique()))
     codes = ", ".join(str(c) for c in sorted(clean["정점코드"].unique()))
 
@@ -293,7 +296,12 @@ def render_home(raw, clean):
         stat_card("관측 정점", station, f"정점코드 {codes}"),
         stat_card("전체 열 수", f"{raw.shape[1]}개", f"수질 측정 항목 {len(MEASURE_COLS)}개", navy=True),
         stat_card("관측 간격", f"약 {interval:.0f}분", "중앙값 기준"),
-        stat_card("미수신·결측 값", f"{n_missing:,}개", f"전체 측정값의 {pct_missing:.2f}%", navy=True),
+        stat_card(
+            "빠진 관측 시각",
+            f"{missing_slots:,}개",
+            f"예상 {expected:,}개 중 {pct_slots:.1f}%" + (f" · 빈 값 {n_blank:,}개" if n_blank else ""),
+            navy=True,
+        ),
     ]
     st.markdown(f'<div class="card-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
@@ -320,7 +328,7 @@ def render_home(raw, clean):
     section("원본 데이터 미리보기", "파일에 저장된 그대로의 처음 5행입니다.")
     st.markdown(html_table(raw.head(5)), unsafe_allow_html=True)
     st.markdown(
-        '<div class="caption">‘미수신’ 같은 문자열이 들어 있는 열은 분석 단계에서 숫자로 바꾸며 결측 처리합니다.</div>',
+        '<div class="caption">숫자가 아닌 값(예: ‘미수신’)이 있으면 분석 단계에서 숫자로 바꾸며 결측 처리합니다.</div>',
         unsafe_allow_html=True,
     )
 
@@ -332,7 +340,7 @@ def render_home(raw, clean):
             <b>제공 기관</b> &nbsp;해양환경공단<br>
             <b>자료 이름</b> &nbsp;해양수질자동측정망 새만금<br>
             <b>자료 기준일</b> &nbsp;2024-12-31<br>
-            <b>사용 파일</b> &nbsp;{escape(DATA_FILENAME)}
+            <b>사용 데이터 주소</b> &nbsp;<a href="{escape(DATA_URL)}" target="_blank">{escape(DATA_URL)}</a>
         </div>
         """,
         unsafe_allow_html=True,
@@ -371,28 +379,18 @@ def render_home(raw, clean):
 # 실행
 # ---------------------------------------------------------------------------
 def main():
-    path = find_data_file()
-    if path is not None:
-        raw_bytes = path.read_bytes()
-    else:
+    try:
+        raw, clean = load_data()
+    except Exception as e:
         st.markdown(
             f'<div class="hero"><div class="hero-icon">{APP_ICON}</div>'
             f'<div><div class="hero-title">{APP_TITLE}</div></div></div>',
             unsafe_allow_html=True,
         )
-        st.warning(
-            f"main.py와 같은 폴더에서 '{DATA_FILENAME}' 파일을 찾지 못했습니다. "
-            "파일을 그 폴더에 넣거나 아래에서 직접 올려 주세요."
-        )
-        uploaded = st.file_uploader("새만금 해양수질 CSV 파일", type=["csv"])
-        if uploaded is None:
-            st.stop()
-        raw_bytes = uploaded.getvalue()
-
-    try:
-        raw, clean = load_data(raw_bytes)
-    except Exception as e:
-        st.error(f"데이터를 읽는 중 문제가 생겼습니다: {e}")
+        st.error(f"데이터를 불러오지 못했습니다: {e}")
+        if st.button("다시 시도"):
+            load_data.clear()
+            st.rerun()
         st.stop()
 
     render_home(raw, clean)
